@@ -38,6 +38,29 @@ test-app: all
 	plutil -replace CFBundleName -string rayfast-test $(TEST)/Contents/Info.plist
 	codesign -s - -f $(TEST) 2>/dev/null || true
 
+# Dev loop next to the real rayfast (which keeps ⌘Space): `make dev` after every edit rebuilds and
+# relaunches the test copy, opened with DEV_KEY. Its own config dir, so recording a hotkey there never
+# rewrites the real config (the real instance would reload it and lose ⌘Space).
+DEV_KEY ?= hyper+9
+DEV_DIR := $(patsubst %/,%,$(or $(TMPDIR),/tmp))/rayfast-dev
+dev:
+	-@pkill -x rayfast-test
+	@$(MAKE) --no-print-directory test-app
+	@mkdir -p $(DEV_DIR)
+	open -n --env RF_NOHOTKEY=1 --env RF_TOGGLE=$(DEV_KEY) --env RF_CONFIG_DIR=$(DEV_DIR) --stderr $(DEV_DIR)/err.log $(TEST)
+	@echo "rayfast-test is running: open it with $(DEV_KEY) (hyper = ctrl+opt+shift+cmd). Logs: $(DEV_DIR)/err.log. Stop: make dev-stop"
+
+dev-stop:
+	-@pkill -x rayfast-test
+
+# Puts the committed code in place as the real rayfast, through the nix config that runs it.
+NIXCFG ?= $(HOME)/workdir/infra/nixpkgs
+ship: dev-stop
+	@git diff --quiet HEAD || { echo "uncommitted changes: commit them first, ship only takes commits"; exit 1; }
+	git push origin HEAD
+	nix flake update rayfast --flake $(NIXCFG)
+	sudo darwin-rebuild switch --flake $(NIXCFG)
+
 clean:
 	rm -rf build
-.PHONY: all run install uninstall test-app clean
+.PHONY: all run install uninstall test-app dev dev-stop ship clean

@@ -10,6 +10,14 @@ make install    # copy to ~/Applications and start at login (LaunchAgent)
 make uninstall
 ```
 
+Working on it while the installed rayfast keeps `⌘Space`:
+
+```
+make dev        # rebuild + relaunch a test copy, opened with hyper+9 (DEV_KEY=... to change)
+make dev-stop   # stop the test copy
+make ship       # push the committed code and switch the nix config (NIXCFG) to it
+```
+
 With Nix, `nix build` gives the same `rayfast.app` under `result/Applications`, and the flake's
 home-manager module replaces `make install` (use one or the other, not both):
 
