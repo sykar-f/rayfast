@@ -5,10 +5,10 @@ LIBS := -framework Cocoa -framework Carbon -framework QuartzCore -framework IOSu
 
 all: $(BIN)
 
-$(BIN): core.m ui.m rf.h Info.plist
+$(BIN): core.m ui.m codex.m rf.h Info.plist
 	@mkdir -p $(APP)/Contents/MacOS
 	cp Info.plist $(APP)/Contents/Info.plist
-	clang $(OPT) core.m ui.m -o $@ $(LIBS) -Wl,-dead_strip
+	clang $(OPT) core.m ui.m codex.m -o $@ $(LIBS) -Wl,-dead_strip
 	strip -x $@
 	codesign -s - -f $(APP) 2>/dev/null || true
 

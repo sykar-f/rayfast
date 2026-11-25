@@ -39,10 +39,19 @@ services.rayfast.enable = true;
 | `↩` | open app / copy answer |
 | `⌘K` on an app | record a global hotkey for it (`⌫` removes, `esc` cancels). Pressing an app's hotkey while it's frontmost hides it |
 | `⌘,` | edit `~/.config/rayfast/config` |
+| `⌘↩` on 2+ words | ask Codex (also `↩` on the "Ask Codex" row, shown when nothing else matches) |
 
 Conversions: `5 km to mi`, `72f`, `3 cups in ml`, `1 gib in mb`, `100 usd to inr`, `€50`, `20% of 150`,
 `sqrt(2)*pi`, `time in nyc`, `london time`, `3pm pst to ist`, `noon tokyo to nyc`.
 Exchange rates come from open.er-api.com (fetched by `/usr/bin/curl`, cached 6h in `~/Library/Caches`).
+
+**Codex.** Asking switches the launcher into a conversation: a `Codex` chip in the search bar, the transcript in
+place of the results, and `↩` sends a follow-up. The conversation survives hiding the launcher; `esc` ends it and
+returns to the launcher. Each turn is a separate `codex exec --json` process (`codex exec resume` for follow-ups), so
+nothing runs between turns. Defaults: model `gpt-6-luna`, sandbox `workspace-write` run from `$TMPDIR/rayfast-codex`
+(codex can write there and in `/tmp`, not in your home, and has no network). The config can override them
+with `codex = /path/to/codex`, `codex_model = …` and `codex_sandbox = read-only`. Answers are rendered with Foundation's
+markdown parser (inline styles); headings, lists, code blocks and tables are handled line by line.
 
 ## Numbers
 
@@ -81,7 +90,7 @@ delivery; rayfast's own work is ~3 ms of it.
   LaunchServices; networking stays out of process (`curl`), so CFNetwork never loads.
 - **`MallocSpaceEfficient=1`** (set by re-execing once at startup) trims ~1 MB of allocator slack.
 
-Code: `core.m` (config, hotkeys, launching, respawn, `main`), `ui.m` (window, renderer, search, conversions),
+Code: `core.m` (config, hotkeys, launching, respawn, `main`), `ui.m` (window, renderer, search, conversions), `codex.m` (Codex turns, markdown),
 `rf.h` (the interface between them).
 
 ## Testing hooks
@@ -95,6 +104,7 @@ latency to stderr), `RF_SNAP=/path/x` (`kill -USR2` renders the window with the 
 `tests/lat.sh` measures resting memory and in-process latency, `tests/active.sh` the open window.
 `tests/bench.sh`, `tests/breakdown.sh` and `tests/h2h.sh` drive QuickKey's ScreenCaptureKit benchmark (built from
 `QuickKey/tests/RenderLatency.m` plus `tests/RenderLatency.patch`; set `$BENCH` to the binary).
+`tests/codex-trigger.sh` checks that conversions and Codex never compete for a query.
 `tests/e2e*.sh` type into the real UI with synthetic keystrokes, so run them with nothing important frontmost.
 
 ## License

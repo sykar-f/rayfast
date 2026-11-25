@@ -70,6 +70,7 @@ NSString *comboString(UInt32 key, UInt32 mods, BOOL pretty) {
 
 NSMutableArray<Binding *> *gBinds;
 Binding *gToggle;
+NSString *gCodexPath, *gCodexModel, *gCodexSandbox;   // optional config overrides; nil = defaults in codex.m
 static UInt32 gNextHid;
 static time_t gCfgMtime;
 
@@ -87,9 +88,14 @@ void rfSaveConfig(void) {
     NSMutableString *s = [NSMutableString stringWithString:
         @"# rayfast config. Reloaded automatically when the launcher opens.\n"
         @"# Modifiers: cmd opt ctrl shift hyper.  Keys: a-z 0-9 f1-f19 space return tab left right up down ...\n"
-        @"# Bind apps with:  ctrl+opt+s = /Applications/Safari.app   (or press ⌘K on an app in the launcher)\n\n"];
+        @"# Bind apps with:  ctrl+opt+s = /Applications/Safari.app   (or press ⌘K on an app in the launcher)\n"
+        @"# Codex (⌘↩ on 2+ words):  codex = /path/to/codex   codex_model = gpt-6-luna   codex_sandbox = read-only\n\n"];
     [s appendFormat:@"toggle = %@\n\n", comboString(gToggle->key, gToggle->mods, NO)];
     for (Binding *b in gBinds) [s appendFormat:@"%@ = %@\n", comboString(b->key, b->mods, NO), b->path];
+    if (gCodexPath || gCodexModel || gCodexSandbox) [s appendString:@"\n"];
+    if (gCodexPath) [s appendFormat:@"codex = %@\n", gCodexPath];
+    if (gCodexModel) [s appendFormat:@"codex_model = %@\n", gCodexModel];
+    if (gCodexSandbox) [s appendFormat:@"codex_sandbox = %@\n", gCodexSandbox];
     [s writeToFile:cfgPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
     gCfgMtime = mtimeOf(cfgPath());
 }
@@ -97,6 +103,7 @@ static void loadConfig(void) {
     for (Binding *b in gBinds) rfUnregister(b);
     if (gToggle) rfUnregister(gToggle);
     gBinds = [NSMutableArray array];
+    gCodexPath = gCodexModel = gCodexSandbox = nil;
     gToggle = [Binding new];
     parseCombo(@"cmd+space", &gToggle->key, &gToggle->mods);
     NSString *txt = [NSString stringWithContentsOfFile:cfgPath() encoding:NSUTF8StringEncoding error:nil];
@@ -109,6 +116,9 @@ static void loadConfig(void) {
         NSString *k = trim([l substringToIndex:r.location]), *v = trim([l substringFromIndex:NSMaxRange(r)]);
         if ([k isEqual:@"toggle"]) { parseCombo(v, &gToggle->key, &gToggle->mods); continue; }
         if ([k isEqual:@"mode"]) continue;   // older configs: there is only one mode now
+        if ([k isEqual:@"codex"]) { gCodexPath = [v stringByExpandingTildeInPath]; continue; }
+        if ([k isEqual:@"codex_model"]) { gCodexModel = v; continue; }
+        if ([k isEqual:@"codex_sandbox"]) { gCodexSandbox = v; continue; }
         Binding *b = [Binding new];
         if (!parseCombo(k, &b->key, &b->mods)) { NSLog(@"rayfast: bad hotkey '%@'", k); continue; }
         b->path = [v stringByExpandingTildeInPath];

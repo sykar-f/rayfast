@@ -309,7 +309,7 @@ static NSString *localCurrency(void) {
 
 #pragma mark - results
 
-enum { K_HEADER, K_APP, K_CALC, K_INFO, K_ACTION };
+enum { K_HEADER, K_APP, K_CALC, K_INFO, K_ACTION, K_ASK };
 @interface App : NSObject { @public NSString *name, *path; char lname[128]; int uses; id icon; /* CGImageRef */ }
 @end
 @implementation App
@@ -319,6 +319,13 @@ enum { K_HEADER, K_APP, K_CALC, K_INFO, K_ACTION };
 @end
 @implementation Item
 @end
+// One exchange of the Codex conversation: the question, the answer (raw markdown + rendered blocks), a failure.
+@interface Turn : NSObject { @public NSString *q, *a, *err; NSArray<NSAttributedString *> *blocks; }
+@end
+@implementation Turn
+@end
+// Codex is offered from two words up (one word is an app or a unit far more often than a question).
+static BOOL multiWord(NSString *q) { return [trim(q) rangeOfString:@" "].location != NSNotFound; }
 static Item *mkItem(int kind, NSString *title, NSString *sub, NSString *copy, NSString *glyph) {
     Item *i = [Item new]; i->kind = kind; i->title = title; i->sub = sub; i->copy = copy; i->glyph = glyph; return i;
 }
@@ -575,12 +582,14 @@ static const int MAXAPPS = 40;
 @interface Panel : NSPanel
 @end
 static void needsRender(void);
+static NSDictionary *attrs(CGFloat size, NSFontWeight w, NSColor *c);
 // A one-line text input that implements NSTextInputClient itself. NSTextField would build a full TextKit
 // field editor, which was ~30 ms of a cold first show; this keeps IME / dead keys / emoji working without it.
 @interface QueryView : NSView <NSTextInputClient> {
 @public
     NSMutableString *text; NSRange sel; NSString *marked;
     void (^onChange)(void);
+    NSString *chip, *placeholder;   // conversation mode: a "Codex" chip before the text, and its own placeholder
 }
 @property (nonatomic) NSString *stringValue;
 @end
@@ -593,15 +602,25 @@ static void needsRender(void);
 - (NSDictionary *)attrs { return @{NSFontAttributeName: [NSFont systemFontOfSize:18], NSForegroundColorAttributeName: NSColor.labelColor}; }
 - (void)changed { needsRender(); if (onChange) onChange(); }
 // Drawn by R's renderer into the window surface (this view never draws itself, so it gets no backing store).
+- (NSDictionary *)chipAttrs { return attrs(13, NSFontWeightSemibold, NSColor.labelColor); }
+- (CGFloat)textX { return chip ? ceil([chip sizeWithAttributes:self.chipAttrs].width) + 18 + 10 : 0; }
 - (CGFloat)caretX {
     NSString *shown = marked ? [text stringByReplacingCharactersInRange:sel withString:marked] : text;
-    return [[shown substringToIndex:sel.location + marked.length] sizeWithAttributes:self.attrs].width;
+    return self.textX + [[shown substringToIndex:sel.location + marked.length] sizeWithAttributes:self.attrs].width;
 }
 - (void)drawContent {
     NSDictionary *a = self.attrs;
     NSString *shown = marked ? [text stringByReplacingCharactersInRange:sel withString:marked] : text;
+    if (chip) {
+        NSRect r = NSMakeRect(0, 1, self.textX - 10, 24);
+        [[NSColor.labelColor colorWithAlphaComponent:0.12] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:r xRadius:6 yRadius:6] fill];
+        NSSize z = [chip sizeWithAttributes:self.chipAttrs];
+        [chip drawAtPoint:NSMakePoint(NSMidX(r) - z.width / 2, NSMidY(r) - z.height / 2) withAttributes:self.chipAttrs];
+        CGContextTranslateCTM(NSGraphicsContext.currentContext.CGContext, self.textX, 0);
+    }
     if (!shown.length) {
-        [@"Search for apps and conversions…" drawAtPoint:NSMakePoint(0, 1) withAttributes:@{NSFontAttributeName: a[NSFontAttributeName], NSForegroundColorAttributeName: NSColor.placeholderTextColor}];
+        [placeholder ?: @"Search for apps and conversions…" drawAtPoint:NSMakePoint(0, 1) withAttributes:@{NSFontAttributeName: a[NSFontAttributeName], NSForegroundColorAttributeName: NSColor.placeholderTextColor}];
     }
     CGFloat x0 = [[shown substringToIndex:sel.location] sizeWithAttributes:a].width;
     if (sel.length && !marked) {
@@ -690,6 +709,7 @@ static void needsRender(void);
 @interface ListView : NSView { @public CGFloat off; }
 - (void)clickAt:(NSPoint)p;
 - (void)scrollBy:(NSEvent *)e;
+- (void)scrollTo:(CGFloat)y;
 @end
 @interface Footer : NSView
 @end
@@ -711,6 +731,7 @@ static void needsRender(void);
     NSMutableArray<App *> *apps; NSArray<Item *> *rows; int sel;
     App *recording; BOOL hiding;
     double lastScan;
+    NSMutableArray<Turn *> *convo;   // non-nil: conversation mode. Survives hiding; esc ends it (and only esc)
 }
 - (BOOL)handleKey:(NSEvent *)e;
 - (void)activateSelected;
@@ -852,7 +873,58 @@ static void needsRender(void) {
 @implementation ListView
 - (BOOL)isFlipped { return YES; }
 - (CGFloat)yOf:(int)idx { CGFloat y = 6; for (int i = 0; i < idx; i++) y += rowHeight(gR->rows[i]); return y; }
-- (CGFloat)contentHeight { return [self yOf:(int)gR->rows.count] + 6; }
+- (CGFloat)contentHeight { return gR->convo ? [self convo:NO] : [self yOf:(int)gR->rows.count] + 6; }
+- (void)scrollTo:(CGFloat)y { off = MAX(0, MIN(y, [self contentHeight] - self.bounds.size.height)); needsRender(); }
+// The conversation: questions in right-aligned bubbles, answers as markdown blocks, code on a tinted card,
+// failures in an outlined box, and a live status line under the turn that is running. Measures only when !draw.
+- (CGFloat)convo:(BOOL)draw {
+    CGFloat x = 24, cw = W - 48, y = 14 - (draw ? off : 0), vh = self.bounds.size.height;
+    NSDictionary *qa = @{NSFontAttributeName: [NSFont systemFontOfSize:14], NSForegroundColorAttributeName: NSColor.labelColor};
+    NSStringDrawingOptions o = NSStringDrawingUsesLineFragmentOrigin;
+    NSColor *tint = [NSColor.labelColor colorWithAlphaComponent:0.07];
+    for (Turn *t in gR->convo) {
+        NSAttributedString *qs = [[NSAttributedString alloc] initWithString:t->q attributes:qa];
+        NSSize z = [qs boundingRectWithSize:NSMakeSize(cw * 0.7, CGFLOAT_MAX) options:o].size;
+        z = NSMakeSize(ceil(z.width), ceil(z.height));
+        NSRect bub = NSMakeRect(x + cw - z.width - 24, y, z.width + 24, z.height + 14);
+        if (draw && NSMaxY(bub) > 0 && y < vh) {
+            [tint setFill]; [[NSBezierPath bezierPathWithRoundedRect:bub xRadius:10 yRadius:10] fill];
+            [qs drawWithRect:NSMakeRect(bub.origin.x + 12, y + 7, z.width, z.height) options:o];
+        }
+        y += bub.size.height + 14;
+        for (NSAttributedString *b in t->blocks) {
+            BOOL code = [b attribute:CX_CODE atIndex:0 effectiveRange:NULL] != nil;
+            CGFloat pad = code ? 10 : 0, bw = cw - 2 * pad;
+            CGFloat bh = ceil([b boundingRectWithSize:NSMakeSize(bw, CGFLOAT_MAX) options:o].size.height);
+            if (draw && y + bh + 2 * pad > 0 && y < vh) {
+                if (code) { [tint setFill]; [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x, y, cw, bh + 2 * pad) xRadius:8 yRadius:8] fill]; }
+                [b drawWithRect:NSMakeRect(x + pad, y + pad, bw, bh) options:o];
+            }
+            y += bh + 2 * pad + 10;
+        }
+        if (t->err) {
+            NSAttributedString *es = [[NSAttributedString alloc] initWithString:[@"⚠  " stringByAppendingString:t->err]
+                attributes:@{NSFontAttributeName: [NSFont systemFontOfSize:13], NSForegroundColorAttributeName: NSColor.labelColor}];
+            CGFloat eh = ceil([es boundingRectWithSize:NSMakeSize(cw - 24, CGFLOAT_MAX) options:o].size.height);
+            NSRect box = NSMakeRect(x, y, cw, eh + 16);
+            if (draw && NSMaxY(box) > 0 && y < vh) {
+                [[NSColor.labelColor colorWithAlphaComponent:0.35] setStroke];
+                NSBezierPath *p = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(box, 0.5, 0.5) xRadius:8 yRadius:8]; p.lineWidth = 1; [p stroke];
+                [es drawWithRect:NSMakeRect(x + 12, y + 8, cw - 24, eh) options:o];
+            }
+            y += box.size.height + 10;
+        }
+        if (t == gR->convo.lastObject && cxBusy()) {
+            NSString *s = [NSString stringWithFormat:@"%@   %ds", cxStatus ?: @"Thinking…", (int)(CFAbsoluteTimeGetCurrent() - cxStartedAt())];
+            if (draw && y + 18 > 0 && y < vh)
+                [s drawWithRect:NSMakeRect(x, y, cw, 18) options:o | NSStringDrawingTruncatesLastVisibleLine
+                     attributes:attrs(13, NSFontWeightRegular, NSColor.secondaryLabelColor)];
+            y += 28;
+        }
+        y += 6;
+    }
+    return y + (draw ? off : 0);
+}
 - (void)reveal {
     if (gR->sel < 0 || gR->sel >= (int)gR->rows.count) { off = 0; return; }
     CGFloat y = [self yOf:gR->sel], h = rowHeight(gR->rows[gR->sel]), vh = self.bounds.size.height;
@@ -867,6 +939,7 @@ static void needsRender(void) {
 }
 - (void)drawContent {
     [gIconSlots removeAllObjects];
+    if (gR->convo) { [self convo:YES]; return; }
     NSDictionary *hdr = attrs(12, NSFontWeightMedium, NSColor.secondaryLabelColor);
     NSDictionary *ttl = attrs(14, NSFontWeightRegular, NSColor.labelColor);
     NSDictionary *sub = attrs(13, NSFontWeightRegular, NSColor.secondaryLabelColor);
@@ -927,7 +1000,7 @@ static void needsRender(void) {
             [parts addObject:[c substringFromIndex:k]];
             for (NSString *pt in parts.reverseObjectEnumerator) right = drawKeycap(pt, right, y + h / 2) - 4;
         } else {
-            right = drawLabelRTL(it->kind == K_APP ? @"Application" : @"Command", acc, right, y + h / 2) - 12;
+            right = drawLabelRTL(it->kind == K_APP ? @"Application" : it->kind == K_ASK ? @"Codex" : @"Command", acc, right, y + h / 2) - 12;
         }
         NSSize ts = [it->title sizeWithAttributes:ttl];
         CGFloat tw = MIN(ts.width, right - 56);
@@ -940,6 +1013,7 @@ static void needsRender(void) {
     }
 }
 - (void)clickAt:(NSPoint)p {
+    if (gR->convo) return;   // the transcript has nothing to click
     CGFloat y = 6 - off;
     for (int i = 0; i < (int)gR->rows.count; i++) {
         CGFloat h = rowHeight(gR->rows[i]);
@@ -955,16 +1029,29 @@ static void needsRender(void) {
 @end
 
 @implementation Footer
+static CGFloat drawSep(CGFloat x, CGFloat mid) {
+    [[NSColor.labelColor colorWithAlphaComponent:0.15] setFill];
+    NSRectFillUsingOperation(NSMakeRect(x, mid - 7, 1, 14), NSCompositingOperationSourceOver);
+    return x - 10;
+}
 - (void)drawContent {
     CGFloat mid = FT / 2;
     NSDictionary *lbl = attrs(12, NSFontWeightMedium, NSColor.labelColor);
     NSDictionary *dim = attrs(12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    CGFloat x = W - 14;
+    if (gR->convo) {   // conversation: which model, and the way back. Progress is shown in the transcript.
+        [[@"Codex · " stringByAppendingString:cxModel()] drawAtPoint:NSMakePoint(40, mid - 8) withAttributes:dim];
+        x = drawKeycap(@"esc", x, mid) - 6; x = drawSep(drawLabelRTL(@"Back to Launcher", dim, x, mid) - 10, mid);
+        BOOL answered = NO; for (Turn *t in gR->convo) if (t->a) answered = YES;
+        if (answered) { x = drawKeycap(@"C", x, mid) - 3; x = drawKeycap(@"⌘", x, mid) - 6; x = drawSep(drawLabelRTL(@"Copy Answer", dim, x, mid) - 10, mid); }
+        x = drawKeycap(@"↩", x, mid) - 6; drawLabelRTL(cxBusy() ? @"Send (when done)" : @"Send", cxBusy() ? dim : lbl, x, mid);
+        return;
+    }
     // left: status (the colour logo mark is its own small layer)
     Item *it = (gR->sel >= 0 && gR->sel < (int)gR->rows.count) ? gR->rows[gR->sel] : nil;
     NSString *status = gR->recording ? @"Recording hotkey…" : (gFetching ? @"Updating exchange rates…" : nil);
     if (status) [status drawAtPoint:NSMakePoint(40, mid - 8) withAttributes:dim];
     // right: primary action ↩ | secondary action ⌘K
-    CGFloat x = W - 14;
     if (gR->recording) {
         x = drawKeycap(@"esc", x, mid) - 6; x = drawLabelRTL(@"Cancel", dim, x, mid) - 12;
         x = drawKeycap(@"⌫", x, mid) - 6; drawLabelRTL(@"Remove Hotkey", dim, x, mid);
@@ -973,11 +1060,15 @@ static void needsRender(void) {
     if (!it) return;
     if (it->kind == K_APP) {
         x = drawKeycap(@"K", x, mid) - 3; x = drawKeycap(@"⌘", x, mid) - 6;
-        x = drawLabelRTL([gR bindingFor:it->app->path] ? @"Change Hotkey" : @"Set Hotkey", dim, x, mid) - 10;
-        [[NSColor.labelColor colorWithAlphaComponent:0.15] setFill]; NSRectFillUsingOperation(NSMakeRect(x, mid - 7, 1, 14), NSCompositingOperationSourceOver); x -= 10;
+        x = drawSep(drawLabelRTL([gR bindingFor:it->app->path] ? @"Change Hotkey" : @"Set Hotkey", dim, x, mid) - 10, mid);
     }
-    NSString *primary = it->kind == K_APP ? @"Open Application" : it->kind == K_CALC ? @"Copy Answer" : it->kind == K_ACTION ? @"Run Command" : nil;
-    if (primary) { x = drawKeycap(@"↩", x, mid) - 6; drawLabelRTL(primary, lbl, x, mid); }
+    NSString *primary = it->kind == K_APP ? @"Open Application" : it->kind == K_CALC ? @"Copy Answer" : it->kind == K_ACTION ? @"Run Command" :
+                        it->kind == K_ASK ? @"Ask Codex" : nil;
+    if (primary) { x = drawKeycap(@"↩", x, mid) - 6; x = drawLabelRTL(primary, lbl, x, mid) - 10; }
+    if (it->kind != K_ASK && multiWord(gR->field.stringValue)) {   // Codex is always one explicit ⌘↩ away
+        x = drawSep(x, mid);
+        x = drawKeycap(@"↩", x, mid) - 3; x = drawKeycap(@"⌘", x, mid) - 6; drawLabelRTL(@"Ask Codex", dim, x, mid);
+    }
 }
 @end
 
@@ -1066,11 +1157,13 @@ static void scanDir(NSMutableArray *out, NSMutableSet *seen, const char *dir, in
     NSString *q = [NSString stringWithContentsOfFile:[snapBase stringByAppendingString:@".q"] encoding:NSUTF8StringEncoding error:nil] ?: @"";
     q = [q stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet];
     NSArray *parts = [q componentsSeparatedByString:@"|"];           // "query|down|down|cmdk"
-    field.stringValue = parts[0];
-    [self refresh];
+    if (![parts[0] isEqual:@"@"]) { field.stringValue = parts[0]; if (!convo) [self refresh]; }
     for (NSString *p in [parts subarrayWithRange:NSMakeRange(1, parts.count - 1)]) {
         if ([p isEqual:@"down"]) [self moveSel:1];
         if ([p isEqual:@"cmdk"]) [self startRecording];
+        if ([p isEqual:@"ask"]) [self askCodex];
+        if ([p isEqual:@"send"]) [self sendTurn:trim(field.stringValue)];
+        if ([p isEqual:@"esc"]) [self endConvo];
     }
     if ([parts containsObject:@"nopng"]) return;
     [self render];
@@ -1123,7 +1216,7 @@ static void scanDir(NSMutableArray *out, NSMutableSet *seen, const char *dir, in
     chrome = [[Chrome alloc] initWithFrame:NSMakeRect(0, 0, W, H)];
     field = [[QueryView alloc] initWithFrame:NSMakeRect(20, H - SH + 15, W - 40, 26)];
     __weak R *ws = self;
-    field->onChange = ^{ R *s = ws; if (s && !s->recording) [s refresh]; };
+    field->onChange = ^{ R *s = ws; if (s && !s->recording && !s->convo) [s refresh]; };
     [canvas addSubview:field];   // in the window for keyboard focus only; it never draws
     list = [[ListView alloc] initWithFrame:NSMakeRect(0, FT + 1, W, H - SH - FT - 1)];
     footer = [[Footer alloc] initWithFrame:NSMakeRect(0, 0, W, FT)];
@@ -1195,6 +1288,14 @@ static void drawView(NSView *v, CGContextRef c) {
         l.hidden = NO;
     }
     for (; n < iconLayers.count; n++) iconLayers[n].hidden = YES;
+    BOOL busy = convo && cxBusy();   // the logo pulses while Codex works (render-server animation, no repaints)
+    if (busy != ([logo animationForKey:@"pulse"] != nil)) {
+        if (busy) {
+            CABasicAnimation *p = [CABasicAnimation animationWithKeyPath:@"opacity"];
+            p.fromValue = @1; p.toValue = @0.2; p.duration = 0.6; p.autoreverses = YES; p.repeatCount = HUGE_VALF; p.removedOnCompletion = NO;
+            [logo addAnimation:p forKey:@"pulse"];
+        } else [logo removeAnimationForKey:@"pulse"];
+    }
     BOOL showCaret = !recording && !field->sel.length;
     caret.hidden = !showCaret;
     if (showCaret) {
@@ -1240,7 +1341,7 @@ static void drawView(NSView *v, CGContextRef c) {
 }
 - (void)show {
     if (!panel) [self makePanel];
-    if (![self idleIsFresh]) [self resetToIdle];   // normally already done when the window last hid
+    if (!convo && ![self idleIsFresh]) [self resetToIdle];   // normally already done when the window last hid; a conversation stays as it was
     prepared = NO;
     shown = YES;
     NSPoint o = [self homeOrigin];
@@ -1261,10 +1362,10 @@ static void drawView(NSView *v, CGContextRef c) {
     recording = nil;
     [panel orderOut:nil];   // also hands keyboard focus back to the previous app
     hiding = NO;
-    dispatch_async(dispatch_get_main_queue(), ^{ if (!shown && panel) { [self resetToIdle]; prepared = YES; } });
+    dispatch_async(dispatch_get_main_queue(), ^{ if (!shown && panel && !convo) { [self resetToIdle]; prepared = YES; } });
     static int gen; int my = ++gen;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        if (my == gen && !shown && !gFetching) rfRespawn();
+        if (my == gen && !shown && !gFetching && !convo) rfRespawn();   // a respawn would lose the conversation
     });
 }
 - (void)windowDidResignKey:(NSNotification *)n { if (shown) [self hide]; }
@@ -1309,6 +1410,10 @@ static void drawView(NSView *v, CGContextRef c) {
             [out addObject:it];
         }
     }
+    if (multiWord(q) && ![out indexesOfObjectsPassingTest:^BOOL(Item *i, NSUInteger n, BOOL *st) { return i->kind != K_HEADER; }].count) {
+        [out addObject:mkItem(K_HEADER, @"Codex", nil, nil, nil)];
+        [out addObject:mkItem(K_ASK, @"Ask Codex", trim(q), nil, @"✦")];
+    }
     rows = out;
     sel = -1;
     for (int i = 0; i < (int)rows.count; i++) if (rows[i]->kind != K_HEADER) { sel = i; break; }
@@ -1328,12 +1433,13 @@ static void drawView(NSView *v, CGContextRef c) {
         [NSPasteboard.generalPasteboard setString:it->copy ?: it->title forType:NSPasteboardTypeString];
         [self hide]; break;
     case K_ACTION: { SEL s = it->action; [self performSelector:s withObject:nil afterDelay:0]; break; }
+    case K_ASK: [self askCodex]; break;
     default: break;
     }
 }
 - (void)moveSel:(int)d {
     int n = (int)rows.count;
-    if (!n || sel < 0) return;
+    if (!n || sel < 0 || convo) return;
     int i = sel;
     for (int step = 0; step < n; step++) {
         i = (i + d + n) % n;
@@ -1375,9 +1481,71 @@ static void drawView(NSView *v, CGContextRef c) {
     recording = nil;
     [self refresh];
 }
+#pragma mark conversation (Codex)
+
+// Classic → conversation: the query becomes the first message.
+- (void)askCodex {
+    NSString *q = trim(field.stringValue);
+    if (!multiWord(q)) { NSBeep(); return; }
+    convo = [NSMutableArray array];
+    field->chip = @"Codex";
+    [self sendTurn:q];
+}
+- (void)sendTurn:(NSString *)q {
+    Turn *t = [Turn new]; t->q = q; t->blocks = @[];
+    [convo addObject:t];
+    field.stringValue = @"";
+    cxSend(q);   // reports back through codexChanged, synchronously for errors that happen before launch
+    static int tickGen; int my = ++tickGen;
+    __block void (^tick)(void) = ^{   // the elapsed-seconds counter: one redraw a second, only while a turn runs
+        if (my != tickGen || !cxBusy() || !convo) { tick = nil; return; }
+        if (shown) needsRender();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), tick);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), tick);
+}
+- (void)codexChanged {
+    Turn *t = convo.lastObject;
+    if (!t) return;
+    if (cxAnswer != t->a) { t->a = cxAnswer; t->blocks = cxAnswer ? cxMarkdown(cxAnswer) : @[]; }
+    t->err = cxError;
+    field->placeholder = cxBusy() ? @"Codex is working… type your next message" : @"Reply to Codex…";
+    [list scrollTo:CGFLOAT_MAX];   // follow the newest content
+}
+// esc: back to the launcher. The conversation is dropped for good (and a running turn killed).
+- (void)endConvo {
+    cxReset();
+    convo = nil;
+    field->chip = field->placeholder = nil;
+    field.stringValue = @"";
+    [self refresh];
+}
+- (BOOL)convoKey:(NSEvent *)e mods:(NSEventModifierFlags)m {
+    switch (e.keyCode) {
+    case 53: [self endConvo]; return YES;
+    case 36: case 76: {
+        NSString *q = trim(field.stringValue);
+        if (q.length && !cxBusy()) [self sendTurn:q]; else NSBeep();
+        return YES;
+    }
+    case 125: [list scrollTo:list->off + 60]; return YES;
+    case 126: [list scrollTo:list->off - 60]; return YES;
+    }
+    if (m == NSEventModifierFlagCommand && e.keyCode == 8 && !field->sel.length) {   // ⌘C with nothing selected: the last answer
+        NSString *a = nil; for (Turn *t in convo) if (t->a) a = t->a;
+        if (!a) { NSBeep(); return YES; }
+        [NSPasteboard.generalPasteboard clearContents];
+        [NSPasteboard.generalPasteboard setString:a forType:NSPasteboardTypeString];
+        return YES;
+    }
+    if (m == NSEventModifierFlagCommand && e.keyCode == 40) return YES;   // ⌘K: no hotkeys to record here
+    return NO;
+}
 - (BOOL)handleKey:(NSEvent *)e {
     if (recording) { [self finishRecording:e]; return YES; }
     NSEventModifierFlags m = e.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl | NSEventModifierFlagShift);
+    if (convo) { if ([self convoKey:e mods:m]) return YES; }
+    else if ((e.keyCode == 36 || e.keyCode == 76) && m == NSEventModifierFlagCommand) { [self askCodex]; return YES; }   // ⌘↩
     switch (e.keyCode) {
     case 53: [self hide]; return YES;
     case 36: case 76: [self activateSelected]; return YES;
@@ -1394,7 +1562,7 @@ static void drawView(NSView *v, CGContextRef c) {
         case 8: return [NSApp sendAction:@selector(copy:) to:nil from:self];            // ⌘C
         case 7: return [NSApp sendAction:@selector(cut:) to:nil from:self];             // ⌘X
         case 0: return [NSApp sendAction:@selector(selectAll:) to:nil from:self];       // ⌘A
-        case 51: field.stringValue = @""; [self refresh]; return YES;                  // ⌘⌫
+        case 51: field.stringValue = @""; if (!convo) [self refresh]; return YES;      // ⌘⌫
         }
     }
     return NO;
@@ -1410,7 +1578,8 @@ void uiRun(void) {
     gIconSlots = [NSMutableArray array];
     app.delegate = gR;
     __weak R *ws = gR;
-    gRatesUpdated = ^{ R *s = ws; if (s && s->shown && !s->recording) [s refresh]; };
+    gRatesUpdated = ^{ R *s = ws; if (s && s->shown && !s->recording && !s->convo) [s refresh]; };
+    cxChanged = ^{ [ws codexChanged]; };
     dispatch_async(dispatch_get_main_queue(), ^{ [gR makePanel]; [gR scanApps]; [gR preShow]; });
     [app run];
 }
