@@ -10,6 +10,18 @@ make install    # copy to ~/Applications and start at login (LaunchAgent)
 make uninstall
 ```
 
+With Nix, `nix build` gives the same `rayfast.app` under `result/Applications`, and the flake's
+home-manager module replaces `make install` (use one or the other, not both):
+
+```nix
+# flake inputs
+rayfast = { url = "github:sykar-f/rayfast"; inputs.nixpkgs.follows = "nixpkgs"; };
+
+# home-manager
+imports = [ inputs.rayfast.homeManagerModules.default ];
+services.rayfast.enable = true;
+```
+
 ## Using it
 
 | | |
