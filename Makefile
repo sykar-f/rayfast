@@ -55,11 +55,13 @@ dev-stop:
 
 # Puts the committed code in place as the real rayfast, through the nix config that runs it.
 NIXCFG ?= $(HOME)/workdir/infra/nixpkgs
+# The darwinConfigurations entry to switch to: the machine's hostname (sykar-macbook) has none of its own.
+NIXHOST ?= macbook
 ship: dev-stop
 	@git diff --quiet HEAD || { echo "uncommitted changes: commit them first, ship only takes commits"; exit 1; }
 	git push origin HEAD
 	nix flake update rayfast --flake $(NIXCFG)
-	sudo darwin-rebuild switch --flake $(NIXCFG)
+	sudo darwin-rebuild switch --flake $(NIXCFG)#$(NIXHOST)
 
 clean:
 	rm -rf build
